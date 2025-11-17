@@ -3,4 +3,15 @@ name = "kalloc"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+non_ascii_idents = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(kernel)',
+    'cfg(CONFIG_RUSTC_HAS_COERCE_POINTEE)',
+] }
+
+[features]
+pin-init = ["dep:pinned-init"]
+
 [dependencies]
+pinned-init = { version = "0.0.10", default-features = false, features = ["alloc"], optional = true }

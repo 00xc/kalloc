@@ -2,137 +2,25 @@
 
 //! Implementation of the kernel's memory allocation infrastructure.
 
-pub mod allocator;
+#![cfg_attr(all(not(test), target_os = "none"), no_std)]
+
 pub mod kbox;
 pub mod kvec;
 pub mod layout;
 
 pub use self::kbox::Box;
-pub use self::kbox::KBox;
-pub use self::kbox::KVBox;
-pub use self::kbox::VBox;
 
 pub use self::kvec::IntoIter;
-pub use self::kvec::KVVec;
-pub use self::kvec::KVec;
-pub use self::kvec::VVec;
 pub use self::kvec::Vec;
 
 /// Indicates an allocation error.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct AllocError;
 
-use crate::error::{code::EINVAL, Result};
 use core::{alloc::Layout, ptr::NonNull};
 
-/// Flags to be used when allocating memory.
-///
-/// They can be combined with the operators `|`, `&`, and `!`.
-///
-/// Values can be used from the [`flags`] module.
-#[derive(Clone, Copy, PartialEq)]
-pub struct Flags(u32);
-
-impl Flags {
-    /// Get the raw representation of this flag.
-    pub(crate) fn as_raw(self) -> u32 {
-        self.0
-    }
-
-    /// Check whether `flags` is contained in `self`.
-    pub fn contains(self, flags: Flags) -> bool {
-        (self & flags) == flags
-    }
-}
-
-impl core::ops::BitOr for Flags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self::Output {
-        Self(self.0 | rhs.0)
-    }
-}
-
-impl core::ops::BitAnd for Flags {
-    type Output = Self;
-    fn bitand(self, rhs: Self) -> Self::Output {
-        Self(self.0 & rhs.0)
-    }
-}
-
-impl core::ops::Not for Flags {
-    type Output = Self;
-    fn not(self) -> Self::Output {
-        Self(!self.0)
-    }
-}
-
-/// Allocation flags.
-///
-/// These are meant to be used in functions that can allocate memory.
-pub mod flags {
-    use super::Flags;
-
-    /// Zeroes out the allocated memory.
-    ///
-    /// This is normally or'd with other flags.
-    pub const __GFP_ZERO: Flags = Flags(bindings::__GFP_ZERO);
-
-    /// Allow the allocation to be in high memory.
-    ///
-    /// Allocations in high memory may not be mapped into the kernel's address space, so this can't
-    /// be used with `kmalloc` and other similar methods.
-    ///
-    /// This is normally or'd with other flags.
-    pub const __GFP_HIGHMEM: Flags = Flags(bindings::__GFP_HIGHMEM);
-
-    /// Users can not sleep and need the allocation to succeed.
-    ///
-    /// A lower watermark is applied to allow access to "atomic reserves". The current
-    /// implementation doesn't support NMI and few other strict non-preemptive contexts (e.g.
-    /// `raw_spin_lock`). The same applies to [`GFP_NOWAIT`].
-    pub const GFP_ATOMIC: Flags = Flags(bindings::GFP_ATOMIC);
-
-    /// Typical for kernel-internal allocations. The caller requires `ZONE_NORMAL` or a lower zone
-    /// for direct access but can direct reclaim.
-    pub const GFP_KERNEL: Flags = Flags(bindings::GFP_KERNEL);
-
-    /// The same as [`GFP_KERNEL`], except the allocation is accounted to kmemcg.
-    pub const GFP_KERNEL_ACCOUNT: Flags = Flags(bindings::GFP_KERNEL_ACCOUNT);
-
-    /// For kernel allocations that should not stall for direct reclaim, start physical IO or
-    /// use any filesystem callback.  It is very likely to fail to allocate memory, even for very
-    /// small allocations.
-    pub const GFP_NOWAIT: Flags = Flags(bindings::GFP_NOWAIT);
-
-    /// Suppresses allocation failure reports.
-    ///
-    /// This is normally or'd with other flags.
-    pub const __GFP_NOWARN: Flags = Flags(bindings::__GFP_NOWARN);
-}
-
-/// Non Uniform Memory Access (NUMA) node identifier.
-#[derive(Clone, Copy, PartialEq)]
-pub struct NumaNode(i32);
-
-impl NumaNode {
-    /// Create a new NUMA node identifier (non-negative integer).
-    ///
-    /// Returns [`EINVAL`] if a negative id or an id exceeding [`bindings::MAX_NUMNODES`] is
-    /// specified.
-    pub fn new(node: i32) -> Result<Self> {
-        // MAX_NUMNODES never exceeds 2**10 because NODES_SHIFT is 0..10.
-        if node < 0 || node >= bindings::MAX_NUMNODES as i32 {
-            return Err(EINVAL);
-        }
-        Ok(Self(node))
-    }
-}
-
-/// Specify necessary constant to pass the information to Allocator that the caller doesn't care
-/// about the NUMA node to allocate memory from.
-impl NumaNode {
-    /// No node preference.
-    pub const NO_NODE: NumaNode = NumaNode(bindings::NUMA_NO_NODE);
+pub trait AllocatorFlags: Copy {
+    fn empty() -> Self;
 }
 
 /// The kernel's [`Allocator`] trait.
@@ -157,6 +45,8 @@ impl NumaNode {
 /// - Implementers must ensure that all trait functions abide by the guarantees documented in the
 ///   `# Guarantees` sections.
 pub unsafe trait Allocator {
+    type Flags: AllocatorFlags;
+
     /// The minimum alignment satisfied by all allocations from this allocator.
     ///
     /// # Guarantees
@@ -181,10 +71,10 @@ pub unsafe trait Allocator {
     ///
     /// Additionally, `Flags` are honored as documented in
     /// <https://docs.kernel.org/core-api/mm-api.html#mm-api-gfp-flags>.
-    fn alloc(layout: Layout, flags: Flags, nid: NumaNode) -> Result<NonNull<[u8]>, AllocError> {
+    fn alloc(layout: Layout, flags: Self::Flags) -> Result<NonNull<[u8]>, AllocError> {
         // SAFETY: Passing `None` to `realloc` is valid by its safety requirements and asks for a
         // new memory allocation.
-        unsafe { Self::realloc(None, layout, Layout::new::<()>(), flags, nid) }
+        unsafe { Self::realloc(None, layout, Layout::new::<()>(), flags) }
     }
 
     /// Re-allocate an existing memory allocation to satisfy the requested `layout` and
@@ -231,8 +121,7 @@ pub unsafe trait Allocator {
         ptr: Option<NonNull<u8>>,
         layout: Layout,
         old_layout: Layout,
-        flags: Flags,
-        nid: NumaNode,
+        flags: Self::Flags,
     ) -> Result<NonNull<[u8]>, AllocError>;
 
     /// Free an existing memory allocation.
@@ -248,15 +137,8 @@ pub unsafe trait Allocator {
         // SAFETY: The caller guarantees that `ptr` points at a valid allocation created by this
         // allocator. We are passing a `Layout` with the smallest possible alignment, so it is
         // smaller than or equal to the alignment previously used with this allocation.
-        let _ = unsafe {
-            Self::realloc(
-                Some(ptr),
-                Layout::new::<()>(),
-                layout,
-                Flags(0),
-                NumaNode::NO_NODE,
-            )
-        };
+        let _ =
+            unsafe { Self::realloc(Some(ptr), Layout::new::<()>(), layout, Self::Flags::empty()) };
     }
 }
 
@@ -266,4 +148,50 @@ pub(crate) fn dangling_from_layout(layout: Layout) -> NonNull<u8> {
 
     // SAFETY: `layout.align()` (and hence `ptr`) is guaranteed to be non-zero.
     unsafe { NonNull::new_unchecked(ptr) }
+}
+
+#[cfg_attr(not(kernel), cfg(test))]
+mod test {
+    use super::*;
+    use std::alloc::{GlobalAlloc, System};
+
+    impl AllocatorFlags for () {
+        fn empty() -> Self {
+            ()
+        }
+    }
+
+    unsafe impl Allocator for System {
+        type Flags = ();
+        const MIN_ALIGN: usize = 32;
+
+        unsafe fn realloc(
+            ptr: Option<NonNull<u8>>,
+            layout: Layout,
+            old_layout: Layout,
+            _: Self::Flags,
+        ) -> Result<NonNull<[u8]>, AllocError> {
+            let out = match ptr {
+                Some(ptr) => match old_layout.size() {
+                    0 => unsafe { NonNull::new(System.alloc(layout)).ok_or(AllocError) },
+                    _ => match layout.size() {
+                        0 => unsafe {
+                            System.dealloc(ptr.as_ptr(), old_layout);
+                            Ok(dangling_from_layout(layout))
+                        },
+                        size => unsafe {
+                            NonNull::new(System.realloc(ptr.as_ptr(), old_layout, size))
+                                .ok_or(AllocError)
+                        },
+                    },
+                },
+                None => match layout.size() {
+                    0 => Ok(dangling_from_layout(layout)),
+                    _ => unsafe { NonNull::new(System.alloc(layout)).ok_or(AllocError) },
+                },
+            }?;
+
+            Ok(NonNull::slice_from_raw_parts(out, layout.size()))
+        }
+    }
 }

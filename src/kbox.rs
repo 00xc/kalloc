@@ -3,10 +3,10 @@
 //! Implementation of [`Box`].
 
 #[allow(unused_imports)] // Used in doc comments.
-use super::allocator::{KVmalloc, Kmalloc, Vmalloc, VmallocPageIter};
-use super::{AllocError, Allocator, Flags, NumaNode};
+use super::{AllocError, Allocator};
 use core::alloc::Layout;
 use core::borrow::{Borrow, BorrowMut};
+use core::fmt;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
@@ -14,12 +14,7 @@ use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::ptr::NonNull;
 use core::result::Result;
-
-use crate::ffi::c_void;
-use crate::fmt;
-use crate::init::InPlaceInit;
-use crate::page::AsPageIter;
-use crate::types::ForeignOwnable;
+#[cfg(feature = "pin-init")]
 use pin_init::{InPlaceWrite, Init, PinInit, ZeroableOption};
 
 /// The kernel's [`Box`] type -- a heap allocation for a single value of type `T`.
@@ -77,15 +72,18 @@ use pin_init::{InPlaceWrite, Init, PinInit, ZeroableOption};
 /// `self.0` is always properly aligned and either points to memory allocated with `A` or, for
 /// zero-sized types, is a dangling, well aligned pointer.
 #[repr(transparent)]
-#[cfg_attr(CONFIG_RUSTC_HAS_COERCE_POINTEE, derive(core::marker::CoercePointee))]
-pub struct Box<#[cfg_attr(CONFIG_RUSTC_HAS_COERCE_POINTEE, pointee)] T: ?Sized, A: Allocator>(
-    NonNull<T>,
-    PhantomData<A>,
-);
+#[cfg_attr(
+    all(kernel, CONFIG_RUSTC_HAS_COERCE_POINTEE),
+    derive(core::marker::CoercePointee)
+)]
+pub struct Box<
+    #[cfg_attr(all(kernel, CONFIG_RUSTC_HAS_COERCE_POINTEE), pointee)] T: ?Sized,
+    A: Allocator,
+>(NonNull<T>, PhantomData<A>);
 
 // This is to allow coercion from `Box<T, A>` to `Box<U, A>` if `T` can be converted to the
 // dynamically-sized type (DST) `U`.
-#[cfg(not(CONFIG_RUSTC_HAS_COERCE_POINTEE))]
+#[cfg(all(kernel, not(CONFIG_RUSTC_HAS_COERCE_POINTEE)))]
 impl<T, U, A> core::ops::CoerceUnsized<Box<U, A>> for Box<T, A>
 where
     T: ?Sized + core::marker::Unsize<U>,
@@ -96,7 +94,7 @@ where
 
 // This is to allow `Box<U, A>` to be dispatched on when `Box<T, A>` can be coerced into `Box<U,
 // A>`.
-#[cfg(not(CONFIG_RUSTC_HAS_COERCE_POINTEE))]
+#[cfg(all(kernel, not(CONFIG_RUSTC_HAS_COERCE_POINTEE)))]
 impl<T, U, A> core::ops::DispatchFromDyn<Box<U, A>> for Box<T, A>
 where
     T: ?Sized + core::marker::Unsize<U>,
@@ -105,44 +103,9 @@ where
 {
 }
 
-/// Type alias for [`Box`] with a [`Kmalloc`] allocator.
-///
-/// # Examples
-///
-/// ```
-/// let b = KBox::new(24_u64, GFP_KERNEL)?;
-///
-/// assert_eq!(*b, 24_u64);
-/// # Ok::<(), Error>(())
-/// ```
-pub type KBox<T> = Box<T, super::allocator::Kmalloc>;
-
-/// Type alias for [`Box`] with a [`Vmalloc`] allocator.
-///
-/// # Examples
-///
-/// ```
-/// let b = VBox::new(24_u64, GFP_KERNEL)?;
-///
-/// assert_eq!(*b, 24_u64);
-/// # Ok::<(), Error>(())
-/// ```
-pub type VBox<T> = Box<T, super::allocator::Vmalloc>;
-
-/// Type alias for [`Box`] with a [`KVmalloc`] allocator.
-///
-/// # Examples
-///
-/// ```
-/// let b = KVBox::new(24_u64, GFP_KERNEL)?;
-///
-/// assert_eq!(*b, 24_u64);
-/// # Ok::<(), Error>(())
-/// ```
-pub type KVBox<T> = Box<T, super::allocator::KVmalloc>;
-
-// SAFETY: All zeros is equivalent to `None` (option layout optimization guarantee:
-// <https://doc.rust-lang.org/stable/std/option/index.html#representation>).
+// // SAFETY: All zeros is equivalent to `None` (option layout optimization guarantee:
+// // <https://doc.rust-lang.org/stable/std/option/index.html#representation>).
+#[cfg(feature = "pin-init")]
 unsafe impl<T, A: Allocator> ZeroableOption for Box<T, A> {}
 
 // SAFETY: `Box` is `Send` if `T` is `Send` because the `Box` owns a `T`.
@@ -253,7 +216,7 @@ where
     ///
     /// New memory is allocated with `A`. The allocation may fail, in which case an error is
     /// returned. For ZSTs no memory is allocated.
-    pub fn new(x: T, flags: Flags) -> Result<Self, AllocError> {
+    pub fn new(x: T, flags: A::Flags) -> Result<Self, AllocError> {
         let b = Self::new_uninit(flags)?;
         Ok(Box::write(b, x))
     }
@@ -272,9 +235,9 @@ where
     /// assert_eq!(*b, 24_u64);
     /// # Ok::<(), Error>(())
     /// ```
-    pub fn new_uninit(flags: Flags) -> Result<Box<MaybeUninit<T>, A>, AllocError> {
+    pub fn new_uninit(flags: A::Flags) -> Result<Box<MaybeUninit<T>, A>, AllocError> {
         let layout = Layout::new::<MaybeUninit<T>>();
-        let ptr = A::alloc(layout, flags, NumaNode::NO_NODE)?;
+        let ptr = A::alloc(layout, flags)?;
 
         // INVARIANT: `ptr` is either a dangling pointer or points to memory allocated with `A`,
         // which is sufficient in size and alignment for storing a `T`.
@@ -284,7 +247,7 @@ where
     /// Constructs a new `Pin<Box<T, A>>`. If `T` does not implement [`Unpin`], then `x` will be
     /// pinned in memory and can't be moved.
     #[inline]
-    pub fn pin(x: T, flags: Flags) -> Result<Pin<Box<T, A>>, AllocError>
+    pub fn pin(x: T, flags: A::Flags) -> Result<Pin<Box<T, A>>, AllocError>
     where
         A: 'static,
     {
@@ -333,10 +296,11 @@ where
     /// assert_eq!(s[3].d.lock().a, 20);
     /// # Ok::<(), Error>(())
     /// ```
+    #[cfg(feature = "pin-init")]
     pub fn pin_slice<Func, Item, E>(
         mut init: Func,
         len: usize,
-        flags: Flags,
+        flags: A::Flags,
     ) -> Result<Pin<Box<[T], A>>, E>
     where
         Func: FnMut(usize) -> Item,
@@ -430,6 +394,7 @@ where
     }
 }
 
+#[cfg(feature = "pin-init")]
 impl<T, A> InPlaceWrite<T> for Box<MaybeUninit<T>, A>
 where
     A: Allocator + 'static,
@@ -452,113 +417,6 @@ where
         unsafe { init.__pinned_init(slot)? };
         // SAFETY: All fields have been initialized.
         Ok(unsafe { Box::assume_init(self) }.into())
-    }
-}
-
-impl<T, A> InPlaceInit<T> for Box<T, A>
-where
-    A: Allocator + 'static,
-{
-    type PinnedSelf = Pin<Self>;
-
-    #[inline]
-    fn try_pin_init<E>(init: impl PinInit<T, E>, flags: Flags) -> Result<Pin<Self>, E>
-    where
-        E: From<AllocError>,
-    {
-        Box::<_, A>::new_uninit(flags)?.write_pin_init(init)
-    }
-
-    #[inline]
-    fn try_init<E>(init: impl Init<T, E>, flags: Flags) -> Result<Self, E>
-    where
-        E: From<AllocError>,
-    {
-        Box::<_, A>::new_uninit(flags)?.write_init(init)
-    }
-}
-
-// SAFETY: The pointer returned by `into_foreign` comes from a well aligned
-// pointer to `T` allocated by `A`.
-unsafe impl<T: 'static, A> ForeignOwnable for Box<T, A>
-where
-    A: Allocator,
-{
-    const FOREIGN_ALIGN: usize = if core::mem::align_of::<T>() < A::MIN_ALIGN {
-        A::MIN_ALIGN
-    } else {
-        core::mem::align_of::<T>()
-    };
-
-    type Borrowed<'a> = &'a T;
-    type BorrowedMut<'a> = &'a mut T;
-
-    fn into_foreign(self) -> *mut c_void {
-        Box::into_raw(self).cast()
-    }
-
-    unsafe fn from_foreign(ptr: *mut c_void) -> Self {
-        // SAFETY: The safety requirements of this function ensure that `ptr` comes from a previous
-        // call to `Self::into_foreign`.
-        unsafe { Box::from_raw(ptr.cast()) }
-    }
-
-    unsafe fn borrow<'a>(ptr: *mut c_void) -> &'a T {
-        // SAFETY: The safety requirements of this method ensure that the object remains alive and
-        // immutable for the duration of 'a.
-        unsafe { &*ptr.cast() }
-    }
-
-    unsafe fn borrow_mut<'a>(ptr: *mut c_void) -> &'a mut T {
-        let ptr = ptr.cast();
-        // SAFETY: The safety requirements of this method ensure that the pointer is valid and that
-        // nothing else will access the value for the duration of 'a.
-        unsafe { &mut *ptr }
-    }
-}
-
-// SAFETY: The pointer returned by `into_foreign` comes from a well aligned
-// pointer to `T` allocated by `A`.
-unsafe impl<T: 'static, A> ForeignOwnable for Pin<Box<T, A>>
-where
-    A: Allocator,
-{
-    const FOREIGN_ALIGN: usize = <Box<T, A> as ForeignOwnable>::FOREIGN_ALIGN;
-    type Borrowed<'a> = Pin<&'a T>;
-    type BorrowedMut<'a> = Pin<&'a mut T>;
-
-    fn into_foreign(self) -> *mut c_void {
-        // SAFETY: We are still treating the box as pinned.
-        Box::into_raw(unsafe { Pin::into_inner_unchecked(self) }).cast()
-    }
-
-    unsafe fn from_foreign(ptr: *mut c_void) -> Self {
-        // SAFETY: The safety requirements of this function ensure that `ptr` comes from a previous
-        // call to `Self::into_foreign`.
-        unsafe { Pin::new_unchecked(Box::from_raw(ptr.cast())) }
-    }
-
-    unsafe fn borrow<'a>(ptr: *mut c_void) -> Pin<&'a T> {
-        // SAFETY: The safety requirements for this function ensure that the object is still alive,
-        // so it is safe to dereference the raw pointer.
-        // The safety requirements of `from_foreign` also ensure that the object remains alive for
-        // the lifetime of the returned value.
-        let r = unsafe { &*ptr.cast() };
-
-        // SAFETY: This pointer originates from a `Pin<Box<T>>`.
-        unsafe { Pin::new_unchecked(r) }
-    }
-
-    unsafe fn borrow_mut<'a>(ptr: *mut c_void) -> Pin<&'a mut T> {
-        let ptr = ptr.cast();
-        // SAFETY: The safety requirements for this function ensure that the object is still alive,
-        // so it is safe to dereference the raw pointer.
-        // The safety requirements of `from_foreign` also ensure that the object remains alive for
-        // the lifetime of the returned value.
-        let r = unsafe { &mut *ptr };
-
-        // SAFETY: This pointer originates from a `Pin<Box<T>>`.
-        unsafe { Pin::new_unchecked(r) }
     }
 }
 
@@ -679,42 +537,5 @@ where
         // - `self.0` was previously allocated with `A`.
         // - `layout` is equal to the `Layout´ `self.0` was allocated with.
         unsafe { A::free(self.0.cast(), layout) };
-    }
-}
-
-/// # Examples
-///
-/// ```
-/// # use kernel::prelude::*;
-/// use kernel::alloc::allocator::VmallocPageIter;
-/// use kernel::page::{AsPageIter, PAGE_SIZE};
-///
-/// let mut vbox = VBox::new((), GFP_KERNEL)?;
-///
-/// assert!(vbox.page_iter().next().is_none());
-///
-/// let mut vbox = VBox::<[u8; PAGE_SIZE]>::new_uninit(GFP_KERNEL)?;
-///
-/// let page = vbox.page_iter().next().expect("At least one page should be available.\n");
-///
-/// // SAFETY: There is no concurrent read or write to the same page.
-/// unsafe { page.fill_zero_raw(0, PAGE_SIZE)? };
-/// # Ok::<(), Error>(())
-/// ```
-impl<T> AsPageIter for VBox<T> {
-    type Iter<'a>
-        = VmallocPageIter<'a>
-    where
-        T: 'a;
-
-    fn page_iter(&mut self) -> Self::Iter<'_> {
-        let ptr = self.0.cast();
-        let size = core::mem::size_of::<T>();
-
-        // SAFETY:
-        // - `ptr` is a valid pointer to the beginning of a `Vmalloc` allocation.
-        // - `ptr` is guaranteed to be valid for the lifetime of `'a`.
-        // - `size` is the size of the `Vmalloc` allocation `ptr` points to.
-        unsafe { VmallocPageIter::new(ptr, size) }
     }
 }

@@ -2,17 +2,10 @@
 
 //! Implementation of [`Vec`].
 
-use super::{
-    allocator::{KVmalloc, Kmalloc, Vmalloc, VmallocPageIter},
-    layout::ArrayLayout,
-    AllocError, Allocator, Box, Flags, NumaNode,
-};
-use crate::{
-    fmt,
-    page::AsPageIter, //
-};
+use super::{AllocError, Allocator, Box, layout::ArrayLayout};
 use core::{
     borrow::{Borrow, BorrowMut},
+    fmt::{self, Debug, Formatter},
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ops::Deref,
@@ -25,44 +18,39 @@ use core::{
     slice::SliceIndex,
 };
 
-mod errors;
-pub use self::errors::{InsertError, PushError, RemoveError};
+/// Error type for [`Vec::push_within_capacity`].
+pub struct PushError<T>(pub T);
 
-/// Create a [`KVec`] containing the arguments.
-///
-/// New memory is allocated with `GFP_KERNEL`.
-///
-/// # Examples
-///
-/// ```
-/// let mut v = kernel::kvec![];
-/// v.push(1, GFP_KERNEL)?;
-/// assert_eq!(v, [1]);
-///
-/// let mut v = kernel::kvec![1; 3]?;
-/// v.push(4, GFP_KERNEL)?;
-/// assert_eq!(v, [1, 1, 1, 4]);
-///
-/// let mut v = kernel::kvec![1, 2, 3]?;
-/// v.push(4, GFP_KERNEL)?;
-/// assert_eq!(v, [1, 2, 3, 4]);
-///
-/// # Ok::<(), Error>(())
-/// ```
-#[macro_export]
-macro_rules! kvec {
-    () => (
-        $crate::alloc::KVec::new()
-    );
-    ($elem:expr; $n:expr) => (
-        $crate::alloc::KVec::from_elem($elem, $n, GFP_KERNEL)
-    );
-    ($($x:expr),+ $(,)?) => (
-        match $crate::alloc::KBox::new_uninit(GFP_KERNEL) {
-            Ok(b) => Ok($crate::alloc::KVec::from($crate::alloc::KBox::write(b, [$($x),+]))),
-            Err(e) => Err(e),
+impl<T> Debug for PushError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Not enough capacity")
+    }
+}
+
+/// Error type for [`Vec::remove`].
+pub struct RemoveError;
+
+impl Debug for RemoveError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Index out of bounds")
+    }
+}
+
+/// Error type for [`Vec::insert_within_capacity`].
+pub enum InsertError<T> {
+    /// The value could not be inserted because the index is out of bounds.
+    IndexOutOfBounds(T),
+    /// The value could not be inserted because the vector is out of capacity.
+    OutOfCapacity(T),
+}
+
+impl<T> Debug for InsertError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            InsertError::IndexOutOfBounds(_) => write!(f, "Index out of bounds"),
+            InsertError::OutOfCapacity(_) => write!(f, "Not enough capacity"),
         }
-    );
+    }
 }
 
 /// The kernel's [`Vec`] type.
@@ -111,45 +99,6 @@ pub struct Vec<T, A: Allocator> {
     len: usize,
     _p: PhantomData<A>,
 }
-
-/// Type alias for [`Vec`] with a [`Kmalloc`] allocator.
-///
-/// # Examples
-///
-/// ```
-/// let mut v = KVec::new();
-/// v.push(1, GFP_KERNEL)?;
-/// assert_eq!(&v, &[1]);
-///
-/// # Ok::<(), Error>(())
-/// ```
-pub type KVec<T> = Vec<T, Kmalloc>;
-
-/// Type alias for [`Vec`] with a [`Vmalloc`] allocator.
-///
-/// # Examples
-///
-/// ```
-/// let mut v = VVec::new();
-/// v.push(1, GFP_KERNEL)?;
-/// assert_eq!(&v, &[1]);
-///
-/// # Ok::<(), Error>(())
-/// ```
-pub type VVec<T> = Vec<T, Vmalloc>;
-
-/// Type alias for [`Vec`] with a [`KVmalloc`] allocator.
-///
-/// # Examples
-///
-/// ```
-/// let mut v = KVVec::new();
-/// v.push(1, GFP_KERNEL)?;
-/// assert_eq!(&v, &[1]);
-///
-/// # Ok::<(), Error>(())
-/// ```
-pub type KVVec<T> = Vec<T, KVmalloc>;
 
 // SAFETY: `Vec` is `Send` if `T` is `Send` because `Vec` owns its elements.
 unsafe impl<T, A> Send for Vec<T, A>
@@ -322,7 +271,7 @@ where
     /// assert_eq!(&v, &[1, 2]);
     /// # Ok::<(), Error>(())
     /// ```
-    pub fn push(&mut self, v: T, flags: Flags) -> Result<(), AllocError> {
+    pub fn push(&mut self, v: T, flags: A::Flags) -> Result<(), AllocError> {
         self.reserve(1, flags)?;
         // SAFETY: The call to `reserve` was successful, so the capacity is at least one greater
         // than the length.
@@ -498,7 +447,7 @@ where
     /// assert!(v.capacity() >= 20);
     /// # Ok::<(), Error>(())
     /// ```
-    pub fn with_capacity(capacity: usize, flags: Flags) -> Result<Self, AllocError> {
+    pub fn with_capacity(capacity: usize, flags: A::Flags) -> Result<Self, AllocError> {
         let mut v = Vec::new();
 
         v.reserve(capacity, flags)?;
@@ -619,7 +568,7 @@ where
     ///
     /// # Ok::<(), Error>(())
     /// ```
-    pub fn reserve(&mut self, additional: usize, flags: Flags) -> Result<(), AllocError> {
+    pub fn reserve(&mut self, additional: usize, flags: A::Flags) -> Result<(), AllocError> {
         let len = self.len();
         let cap = self.capacity();
 
@@ -647,7 +596,6 @@ where
                 layout.into(),
                 self.layout.into(),
                 flags,
-                NumaNode::NO_NODE,
             )?
         };
 
@@ -737,7 +685,7 @@ where
 
 impl<T: Clone, A: Allocator> Vec<T, A> {
     /// Extend the vector by `n` clones of `value`.
-    pub fn extend_with(&mut self, n: usize, value: T, flags: Flags) -> Result<(), AllocError> {
+    pub fn extend_with(&mut self, n: usize, value: T, flags: A::Flags) -> Result<(), AllocError> {
         if n == 0 {
             return Ok(());
         }
@@ -776,7 +724,7 @@ impl<T: Clone, A: Allocator> Vec<T, A> {
     /// assert_eq!(&v, &[1, 20, 30, 40, 50, 60]);
     /// # Ok::<(), Error>(())
     /// ```
-    pub fn extend_from_slice(&mut self, other: &[T], flags: Flags) -> Result<(), AllocError> {
+    pub fn extend_from_slice(&mut self, other: &[T], flags: A::Flags) -> Result<(), AllocError> {
         self.reserve(other.len(), flags)?;
         for (slot, item) in core::iter::zip(self.spare_capacity_mut(), other) {
             slot.write(item.clone());
@@ -792,7 +740,7 @@ impl<T: Clone, A: Allocator> Vec<T, A> {
     }
 
     /// Create a new `Vec<T, A>` and extend it by `n` clones of `value`.
-    pub fn from_elem(value: T, n: usize, flags: Flags) -> Result<Self, AllocError> {
+    pub fn from_elem(value: T, n: usize, flags: A::Flags) -> Result<Self, AllocError> {
         let mut v = Self::with_capacity(n, flags)?;
 
         v.extend_with(n, value, flags)?;
@@ -817,7 +765,7 @@ impl<T: Clone, A: Allocator> Vec<T, A> {
     ///
     /// # Ok::<(), Error>(())
     /// ```
-    pub fn resize(&mut self, new_len: usize, value: T, flags: Flags) -> Result<(), AllocError> {
+    pub fn resize(&mut self, new_len: usize, value: T, flags: A::Flags) -> Result<(), AllocError> {
         match new_len.checked_sub(self.len()) {
             Some(n) => self.extend_with(n, value, flags),
             None => {
@@ -1031,43 +979,6 @@ where
     }
 }
 
-/// # Examples
-///
-/// ```
-/// # use kernel::prelude::*;
-/// use kernel::alloc::allocator::VmallocPageIter;
-/// use kernel::page::{AsPageIter, PAGE_SIZE};
-///
-/// let mut vec = VVec::<u8>::new();
-///
-/// assert!(vec.page_iter().next().is_none());
-///
-/// vec.reserve(PAGE_SIZE, GFP_KERNEL)?;
-///
-/// let page = vec.page_iter().next().expect("At least one page should be available.\n");
-///
-/// // SAFETY: There is no concurrent read or write to the same page.
-/// unsafe { page.fill_zero_raw(0, PAGE_SIZE)? };
-/// # Ok::<(), Error>(())
-/// ```
-impl<T> AsPageIter for VVec<T> {
-    type Iter<'a>
-        = VmallocPageIter<'a>
-    where
-        T: 'a;
-
-    fn page_iter(&mut self) -> Self::Iter<'_> {
-        let ptr = self.ptr.cast();
-        let size = self.layout.size();
-
-        // SAFETY:
-        // - `ptr` is a valid pointer to the beginning of a `Vmalloc` allocation.
-        // - `ptr` is guaranteed to be valid for the lifetime of `'a`.
-        // - `size` is the size of the `Vmalloc` allocation `ptr` points to.
-        unsafe { VmallocPageIter::new(ptr, size) }
-    }
-}
-
 /// An [`Iterator`] implementation for [`Vec`] that moves elements out of a vector.
 ///
 /// This structure is created by the [`Vec::into_iter`] method on [`Vec`] (provided by the
@@ -1137,7 +1048,7 @@ where
     ///
     /// Note that `IntoIter::collect` doesn't require `Flags`, since it re-uses the existing backing
     /// buffer. However, this backing buffer may be shrunk to the actual count of elements.
-    pub fn collect(self, flags: Flags) -> Vec<T, A> {
+    pub fn collect(self, flags: A::Flags) -> Vec<T, A> {
         let old_layout = self.layout;
         let (mut ptr, buf, len, mut cap) = self.into_raw_parts();
         let has_advanced = ptr != buf.as_ptr();
@@ -1162,13 +1073,7 @@ where
             // the type invariant to be smaller than `cap`. Depending on `realloc` this operation
             // may shrink the buffer or leave it as it is.
             ptr = match unsafe {
-                A::realloc(
-                    Some(buf.cast()),
-                    layout.into(),
-                    old_layout.into(),
-                    flags,
-                    NumaNode::NO_NODE,
-                )
+                A::realloc(Some(buf.cast()), layout.into(), old_layout.into(), flags)
             } {
                 // If we fail to shrink, which likely can't even happen, continue with the existing
                 // buffer.
@@ -1351,18 +1256,20 @@ impl<'vec, T> Drop for DrainAll<'vec, T> {
     }
 }
 
-#[macros::kunit_tests(rust_kvec)]
+#[cfg_attr(not(kernel), cfg(test))]
 mod tests {
     use super::*;
-    use crate::prelude::*;
+    use std::alloc::System;
+
+    type TVec<T> = Vec<T, System>;
 
     #[test]
     fn test_kvec_retain() {
         /// Verify correctness for one specific function.
         #[expect(clippy::needless_range_loop)]
         fn verify(c: &[bool]) {
-            let mut vec1: KVec<usize> = KVec::with_capacity(c.len(), GFP_KERNEL).unwrap();
-            let mut vec2: KVec<usize> = KVec::with_capacity(c.len(), GFP_KERNEL).unwrap();
+            let mut vec1: TVec<usize> = TVec::with_capacity(c.len(), ()).unwrap();
+            let mut vec2: TVec<usize> = TVec::with_capacity(c.len(), ()).unwrap();
 
             for i in 0..c.len() {
                 vec1.push_within_capacity(i).unwrap();
@@ -1389,7 +1296,7 @@ mod tests {
         // This boolean array represents a function from index to boolean. We check that `retain`
         // behaves correctly for all possible boolean arrays of every possible length less than
         // ten.
-        let mut func = KVec::with_capacity(10, GFP_KERNEL).unwrap();
+        let mut func = TVec::with_capacity(10, ()).unwrap();
         for len in 0..10 {
             for _ in 0u32..1u32 << len {
                 verify(&func);
