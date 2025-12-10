@@ -1256,7 +1256,7 @@ impl<'vec, T> Drop for DrainAll<'vec, T> {
     }
 }
 
-#[cfg_attr(not(kernel), cfg(test))]
+#[cfg(all(test, not(kernel)))]
 mod tests {
     use super::*;
     use std::alloc::System;

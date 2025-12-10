@@ -165,7 +165,7 @@ pub(crate) fn dangling_from_layout(layout: Layout) -> NonNull<u8> {
     unsafe { NonNull::new_unchecked(ptr) }
 }
 
-#[cfg_attr(not(kernel), cfg(test))]
+#[cfg(all(test, not(kernel)))]
 mod test {
     use super::*;
     use std::alloc::{GlobalAlloc, System};
