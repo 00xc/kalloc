@@ -34,7 +34,9 @@ pub struct AllocError;
 
 use core::{alloc::Layout, ptr::NonNull};
 
+/// Flags accepted by an [`Allocator`].
 pub trait AllocatorFlags: Copy {
+    /// An empty set of flags.
     fn empty() -> Self;
 }
 
@@ -60,6 +62,7 @@ pub trait AllocatorFlags: Copy {
 /// - Implementers must ensure that all trait functions abide by the guarantees documented in the
 ///   `# Guarantees` sections.
 pub unsafe trait Allocator {
+    /// Flags passed to this trait's methods to control allocator behavior.
     type Flags: AllocatorFlags;
 
     /// The minimum alignment satisfied by all allocations from this allocator.
