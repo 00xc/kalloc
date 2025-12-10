@@ -160,18 +160,18 @@ pub unsafe trait Allocator {
     }
 }
 
-/// Returns a properly aligned dangling pointer from the given `layout`.
-pub(crate) fn dangling_from_layout(layout: Layout) -> NonNull<u8> {
-    let ptr = layout.align() as *mut u8;
-
-    // SAFETY: `layout.align()` (and hence `ptr`) is guaranteed to be non-zero.
-    unsafe { NonNull::new_unchecked(ptr) }
-}
-
 #[cfg(all(test, not(kernel)))]
 mod test {
     use super::*;
     use std::alloc::{GlobalAlloc, System};
+
+    /// Returns a properly aligned dangling pointer from the given `layout`.
+    fn dangling_from_layout(layout: Layout) -> NonNull<u8> {
+        let ptr = layout.align() as *mut u8;
+
+        // SAFETY: `layout.align()` (and hence `ptr`) is guaranteed to be non-zero.
+        unsafe { NonNull::new_unchecked(ptr) }
+    }
 
     impl AllocatorFlags for () {
         fn empty() -> Self {
