@@ -3,6 +3,21 @@
 //! Implementation of the kernel's memory allocation infrastructure.
 
 #![cfg_attr(all(not(test), target_os = "none"), no_std)]
+// `feature(derive_coerce_pointee)` is expected to become stable. Before Rust
+// 1.84.0, it did not exist, so enable the predecessor features.
+#![cfg_attr(
+    all(kernel, CONFIG_RUSTC_HAS_COERCE_POINTEE),
+    feature(derive_coerce_pointee)
+)]
+#![cfg_attr(
+    all(kernel, not(CONFIG_RUSTC_HAS_COERCE_POINTEE)),
+    feature(coerce_unsized)
+)]
+#![cfg_attr(
+    all(kernel, not(CONFIG_RUSTC_HAS_COERCE_POINTEE)),
+    feature(dispatch_from_dyn)
+)]
+#![cfg_attr(all(kernel, not(CONFIG_RUSTC_HAS_COERCE_POINTEE)), feature(unsize))]
 
 pub mod kbox;
 pub mod kvec;
