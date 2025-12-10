@@ -11,7 +11,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 ] }
 
 [features]
-pin-init = ["dep:pinned-init"]
+pin-init = ["dep:pin-init"]
 
 [dependencies]
-pinned-init = { version = "0.0.10", default-features = false, features = ["alloc"], optional = true }
+pin-init = { version = "0.0.10", default-features = false, features = ["alloc"], optional = true, package = "pinned-init" }
